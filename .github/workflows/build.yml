@@ -1,0 +1,28 @@
+name: Build and tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Build and run checks
+        run: ./build.sh "$RUNNER_TEMP/ESOAddons.app"
+      - name: Verify app bundle
+        run: |
+          codesign --verify --strict "$RUNNER_TEMP/ESOAddons.app"
+          plutil -lint "$RUNNER_TEMP/ESOAddons.app/Contents/Info.plist"
+          lipo "$RUNNER_TEMP/ESOAddons.app/Contents/MacOS/ESOAddons" -verify_arch arm64
