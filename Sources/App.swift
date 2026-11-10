@@ -165,7 +165,11 @@ import AppKit
         if !filters.gameVersion.isEmpty { versions.insert(filters.gameVersion) }
         return versions.sorted { $0.compare($1, options: .numeric) == .orderedDescending }
     }
-    var rows: [AddonRow] { filters.apply(baseRows, query: query) }
+    var rows: [AddonRow] {
+        let sorted = filters.apply(baseRows, query: query)
+        guard section == "installed" else { return sorted }
+        return sorted.filter(\.update) + sorted.filter { !$0.update }
+    }
     var baseRows: [AddonRow] {
         switch section {
         case "browse":
