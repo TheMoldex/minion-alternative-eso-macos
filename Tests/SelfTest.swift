@@ -275,6 +275,7 @@ func zip(_ names: [String], symbolic: Bool = false, body: String = "fixture") ->
     static func live(temp: URL, root: URL) async throws {
         let fm = FileManager.default
         let client = CatalogClient(cache: temp.appendingPathComponent("catalog.json"))
+        let download: @Sendable (Addon, URL) async throws -> URL = { try await client.download($0, to: $1) }
         let catalog = try await client.catalog()
         let categories = try await client.categories()
         check(categories[17]?.icon != nil && categories[53]?.title == "Libraries", "live category metadata received")
@@ -296,7 +297,7 @@ func zip(_ names: [String], symbolic: Bool = false, body: String = "fixture") ->
         let sentinel = saved.appendingPathComponent("sentinel.lua"); try custom.write(to: sentinel)
         let installer = Installer(home: temp.appendingPathComponent("state"))
         let planned = try dependencyPlan([lam], catalog: catalog, locals: scanAddons(root), sources: [:])
-        try await installer.install(planned, root: root, client: client) { print("Downloading: \($0)") }
+        try await installer.install(planned, root: root, download: download) { print("Downloading: \($0)") }
         let installed = try scanAddons(root)
         check(installed.first?.primary?.version == lam.version, "live package installed")
         check(!fm.fileExists(atPath: directory.appendingPathComponent("custom.txt").path), "obsolete files replaced")
@@ -311,11 +312,11 @@ func zip(_ names: [String], symbolic: Bool = false, body: String = "fixture") ->
         check(try String(contentsOf: directory.appendingPathComponent("LibAddonMenu-2.0.addon"), encoding: .utf8) == prior, "rollback restores version")
         check(try Data(contentsOf: sentinel) == custom, "SavedVariables untouched")
         try fm.removeItem(at: directory)
-        try await installer.install(planned, root: root, client: client) { _ in }
+        try await installer.install(planned, root: root, download: download) { _ in }
         let fresh = try await installer.backups(root)[0]
         try await installer.restore(fresh, root: root)
         check(!fm.fileExists(atPath: directory.path), "rollback removes a newly installed addon")
-        try await installer.install(planned, root: root, client: client) { _ in }
+        try await installer.install(planned, root: root, download: download) { _ in }
         var interrupted = try await installer.backups(root)[0]
         interrupted.status = "applying"
         let home = await installer.libraryHome(root)
@@ -328,7 +329,7 @@ func zip(_ names: [String], symbolic: Bool = false, body: String = "fixture") ->
         try fm.createDirectory(at: dependencyRoot, withIntermediateDirectories: true)
         let rechargePlan = try dependencyPlan([autoRecharge], catalog: catalog, locals: [], sources: [:])
         check(Set(rechargePlan.addons.map(\.id)) == [1091, 7] && rechargePlan.missing.isEmpty, "real addon includes missing library")
-        try await installer.install(rechargePlan, root: dependencyRoot, client: client) { print("Downloading dependency fixture: \($0)") }
+        try await installer.install(rechargePlan, root: dependencyRoot, download: download) { print("Downloading dependency fixture: \($0)") }
         let dependencyLocals = try scanAddons(dependencyRoot)
         check(dependencyLocals.contains { $0.folder == "Recharge" }, "real addon installed with its dependency")
         let dependencyLibrary = dependencyLocals.filter { $0.folder == "LibAddonMenu-2.0" }
@@ -353,12 +354,12 @@ func zip(_ names: [String], symbolic: Bool = false, body: String = "fixture") ->
         let autoRoot = temp.appendingPathComponent("automatic/live/AddOns")
         try makeLocal(autoRoot, "LibAddonMenu-2.0", version: "0", number: 0)
         try await installer.save(LibraryState(ignored: [7]), root: autoRoot)
-        let ignoredCount = try await automaticUpdate(root: autoRoot, client: client, installer: installer, minion: temp.appendingPathComponent("no-minion.xml"), canModify: {}, progress: { _ in })
-        check(try ignoredCount == 0 && scanAddons(autoRoot).first?.primary?.version == "0", "background updates skip ignored addons")
+        let ignored = try await automaticUpdate(root: autoRoot, client: client, installer: installer, minion: temp.appendingPathComponent("no-minion.xml"), canModify: {}, progress: { _ in })
+        check(try ignored.installed.isEmpty && ignored.failures.isEmpty && scanAddons(autoRoot).first?.primary?.version == "0", "background updates skip ignored addons")
         try await installer.save(LibraryState(), root: autoRoot)
         let updated = try await automaticUpdate(root: autoRoot, client: client, installer: installer, minion: temp.appendingPathComponent("no-minion.xml"), canModify: {}, progress: { _ in })
         let autoInstalled = try scanAddons(autoRoot)
-        check(updated == 1 && autoInstalled.first?.primary?.version == lam.version, "automatic updater installs a newer version")
+        check(updated.installed.count == 1 && updated.failures.isEmpty && autoInstalled.first?.primary?.version == lam.version, "automatic updater installs a newer version")
         let autoCopies = try await installer.backups(autoRoot)
         check(autoCopies.count == 1 && autoCopies[0].status == "committed", "automatic update creates a backup")
         try await installer.restore(autoCopies[0], root: autoRoot)
@@ -367,16 +368,23 @@ func zip(_ names: [String], symbolic: Bool = false, body: String = "fixture") ->
         }
         check(try scanAddons(autoRoot).first?.primary?.version == "0", "paused automatic update changes no addon files")
         let copiesBeforePause = try await installer.backups(autoRoot).count
-        await rejectsAsync("game launch before commit stops installation") { try await installer.install(planned, root: autoRoot, client: client, beforeCommit: { throw AppError("backgroundPaused") }, progress: { _ in }) }
+        await rejectsAsync("game launch before commit stops installation") { try await installer.install(planned, root: autoRoot, beforeCommit: { throw AppError("backgroundPaused") }, download: download, progress: { _ in }) }
         check(try scanAddons(autoRoot).first?.primary?.version == "0", "pre-commit pause preserves old version")
         check(try await installer.backups(autoRoot).count == copiesBeforePause, "pre-commit pause leaves no partial backup")
         guard let quest = catalog.first(where: { $0.id == 13 }) else { fatalError("missing quest fixture") }
         let questRoot = temp.appendingPathComponent("quest/live/AddOns")
         try fm.createDirectory(at: questRoot, withIntermediateDirectories: true)
         let questPlan = try dependencyPlan([quest], catalog: catalog, locals: [], sources: [:])
-        try await installer.install(questPlan, root: questRoot, client: client) { print("Quest package: \($0)") }
+        try await installer.install(questPlan, root: questRoot, download: download) { print("Quest package: \($0)") }
         check(try scanAddons(questRoot).contains { $0.folder == "RavaloxsQuestTracker" && $0.primary?.version == quest.version }, "real Ravalox archive installs despite obsolete documentation folder")
         check(!fm.fileExists(atPath: questRoot.appendingPathComponent("Ravalox'QuestTracker").path), "obsolete placeholder directory is never installed")
+        guard let icons = catalog.first(where: { $0.id == 4161 }) else { fatalError("missing LibCustomIcons fixture") }
+        let iconsRoot = temp.appendingPathComponent("custom-icons/live/AddOns")
+        try fm.createDirectory(at: iconsRoot, withIntermediateDirectories: true)
+        let iconsPlan = try dependencyPlan([icons], catalog: catalog, locals: [], sources: [:])
+        let iconsResult = try await installer.install(iconsPlan, root: iconsRoot, download: download) { print("Icons package: \($0)") }
+        check(try iconsResult.failures.isEmpty && scanAddons(iconsRoot).contains { $0.folder == "LibCustomIcons" && $0.primary?.version == icons.version }, "real LibCustomIcons archive installs")
+        check(!fm.fileExists(atPath: iconsRoot.appendingPathComponent("LibCustomIcons/icons/MikaMilka/.gitkeep").path), "LibCustomIcons placeholder is not installed")
         check(catalog.contains { $0.favorites != nil && $0.downloadsMonthly != nil }, "live catalog provides favorite and monthly download counts")
         print("PASS: live ESOUI download, checksum, install, backup, restore, crash recovery, automatic dependency install (\(checks) total checks)")
     }

@@ -49,7 +49,7 @@ Les mises à jour automatiques sont activées par défaut et vérifiées toutes 
 
 L’action **Ignorer les mises à jour** exclut une extension de **Tout mettre à jour** et des mises à jour automatiques. Son bouton individuel reste disponible. Les exclusions se gèrent dans les réglages des mises à jour. Si une extension exige une bibliothèque ignorée plus récente, l’opération s’arrête au lieu de la mettre à jour silencieusement.
 
-Tu peux choisir de 1 à 4 téléchargements simultanés ; la valeur par défaut est 3. Les fichiers sont téléchargés et vérifiés avant installation. Un échec annule le reste du téléchargement groupé avant de remplacer les extensions.
+Tu peux choisir de 1 à 4 téléchargements simultanés ; la valeur par défaut est 3. Les fichiers sont téléchargés et vérifiés avant installation. Si un téléchargement ou la vérification d’une archive échoue, ce paquet est ignoré. Les autres extensions sont mises à jour si leurs bibliothèques requises sont disponibles. Le résultat indique les paquets ignorés et la raison.
 
 Fermer la fenêtre laisse l’application dans la barre des menus lorsque les mises à jour automatiques sont activées. Utilise le menu de l’application pour la quitter complètement. Il n’y a ni service système ni lancement automatique après redémarrage du Mac. La mise en veille suspend les vérifications. Ne lance pas de mises à jour manuelles dans Minion et cette application en même temps.
 

@@ -23,7 +23,7 @@ enum RuntimeSafety {
     }
 }
 
-func automaticUpdate(root: URL, client: CatalogClient, installer: Installer, minion: URL, parallelism: Int = 3, canModify: @Sendable () throws -> Void, progress: @escaping @Sendable (String) async -> Void) async throws -> Int {
+func automaticUpdate(root: URL, client: CatalogClient, installer: Installer, minion: URL, parallelism: Int = 3, canModify: @Sendable () throws -> Void, progress: @escaping @Sendable (String) async -> Void) async throws -> InstallResult {
     try canModify()
     _ = try await installer.recover(root, canModify: canModify)
     let catalog = try await client.catalog(force: true)
@@ -34,12 +34,11 @@ func automaticUpdate(root: URL, client: CatalogClient, installer: Installer, min
     let matches = locals.compactMap { resolveSource($0.folder, catalog: catalog, sources: sources) }
     let updates = matches.filter { !state.ignored.contains($0.id) && $0.supported && updateAvailable($0, locals: locals, sources: sources) }
     let unique = Dictionary(updates.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-    guard !unique.isEmpty else { return 0 }
+    guard !unique.isEmpty else { return InstallResult() }
     let plan = try dependencyPlan(Array(unique.values), catalog: catalog, locals: locals, sources: sources)
     try respectIgnored(plan, ignored: state.ignored)
     try canModify()
-    try await installer.install(plan, root: root, client: client, parallelism: parallelism, beforeCommit: canModify, progress: progress)
-    return unique.count
+    return try await installer.install(plan, root: root, parallelism: parallelism, beforeCommit: canModify, download: { try await client.download($0, to: $1) }, progress: progress)
 }
 
 func removalDependents(folders: [String], locals: [LocalAddon]) -> [String] {
@@ -118,15 +117,25 @@ func respectIgnored(_ plan: InstallPlan, ignored: Set<Int>) throws {
     guard blocked.isEmpty else { throw AppError("ignoredDependency", blocked.map(\.title).joined(separator: ", ")) }
 }
 
-func parallelDownloads(_ addons: [Addon], limit: Int, download: @escaping @Sendable (Addon) async throws -> URL) async throws -> [Int: URL] {
-    try await withThrowingTaskGroup(of: (Int, URL).self) { group in
-        var next = addons.makeIterator(), result = [Int: URL]()
-        for _ in 0..<min(max(1, limit), 4) {
-            if let addon = next.next() { group.addTask { (addon.id, try await download(addon)) } }
+func parallelDownloads(_ addons: [Addon], limit: Int, download: @escaping @Sendable (Addon) async throws -> URL) async throws -> [Int: Result<URL, AppError>] {
+    let fetch: @Sendable (Addon) async throws -> (Int, Result<URL, AppError>) = { addon in
+        try Task.checkCancellation()
+        do { return (addon.id, .success(try await download(addon))) }
+        catch {
+            try Task.checkCancellation()
+            if error is CancellationError { throw error }
+            return (addon.id, .failure(packageError(error, addon: addon, stage: "download")))
         }
-        while let (id, file) = try await group.next() {
-            result[id] = file
-            if let addon = next.next() { group.addTask { (addon.id, try await download(addon)) } }
+    }
+    return try await withThrowingTaskGroup(of: (Int, Result<URL, AppError>).self) { group in
+        var next = addons.makeIterator(), result = [Int: Result<URL, AppError>]()
+        for _ in 0..<min(max(1, limit), 4) {
+            if let addon = next.next() { group.addTask { try await fetch(addon) } }
+        }
+        while let (id, outcome) = try await group.next() {
+            try Task.checkCancellation()
+            result[id] = outcome
+            if let addon = next.next() { group.addTask { try await fetch(addon) } }
         }
         return result
     }

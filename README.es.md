@@ -49,7 +49,7 @@ Las actualizaciones automáticas están activadas por defecto y se comprueban ca
 
 **Ignorar actualizaciones** excluye un complemento de **Actualizar todo** y de las actualizaciones automáticas. Su botón individual sigue disponible. Las exclusiones se gestionan en los ajustes de actualizaciones. Si otro complemento necesita una versión más reciente de una biblioteca ignorada, la operación se detiene en lugar de actualizarla sin avisar.
 
-Puedes elegir de 1 a 4 descargas simultáneas; el valor inicial es 3. Los archivos se descargan y verifican antes de instalar. Si una descarga falla, se cancela el resto del grupo antes de sustituir los complementos.
+Puedes elegir de 1 a 4 descargas simultáneas; el valor inicial es 3. Los archivos se descargan y verifican antes de instalar. Si falla la descarga o la comprobación de un archivo, se omite ese paquete. Los demás complementos se actualizan si sus bibliotecas necesarias están disponibles. El resultado indica los paquetes omitidos y el motivo.
 
 Cerrar la ventana deja la aplicación en la barra de menús cuando las actualizaciones automáticas están activadas. Utiliza el menú de la aplicación para salir por completo. No hay servicio del sistema ni inicio automático después de reiniciar el Mac. El reposo suspende las comprobaciones. No ejecutes actualizaciones manuales en Minion y esta aplicación a la vez.
 

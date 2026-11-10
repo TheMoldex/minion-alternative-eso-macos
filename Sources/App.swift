@@ -107,11 +107,18 @@ import AppKit
         await record("autoUpdates", "started")
         do {
             activity = "installing"
-            backgroundCount = try await automaticUpdate(root: root, client: client, installer: installer, minion: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".minion/minion.xml"), parallelism: parallelism, canModify: { try RuntimeSafety.requireIdle() }) { title in await self.showProgress(title) }
+            let result = try await automaticUpdate(root: root, client: client, installer: installer, minion: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".minion/minion.xml"), parallelism: parallelism, canModify: { try RuntimeSafety.requireIdle() }) { title in await self.showProgress(title) }
+            backgroundCount = result.installed.count
             catalog = await client.cached(); try await loadLocal(root, cleanup: backgroundCount > 0)
             backgroundState = backgroundCount == 0 ? "autoNoUpdates" : "autoDone"
             activity = backgroundCount == 0 ? "ready" : "installedDone"
-            await record("autoUpdates", "completed", detail: "\(backgroundCount)")
+            if let failure = installError(result) {
+                backgroundError = failure
+                nextBackground = Date().addingTimeInterval(900)
+                await record("autoUpdates", "failed", error: failure)
+            } else {
+                await record("autoUpdates", "completed", detail: "\(backgroundCount)")
+            }
         } catch {
             await record("autoUpdates", "failed", error: error)
             backgroundError = error
@@ -238,11 +245,17 @@ import AppKit
         defer { busy = false; detail = "" }
         await record("installing", "started", detail: planned.addons.map(\.title).joined(separator: ", "))
         do {
-            try await installer.install(planned, root: root, client: client, parallelism: parallelism) { title in
+            let result = try await installer.install(planned, root: root, parallelism: parallelism, download: { [client] in try await client.download($0, to: $1) }) { title in
                 await self.showProgress(title)
             }
-            try await loadLocal(root, cleanup: true); activity = "installedDone"
-            await record("installing", "completed", detail: planned.addons.map(\.title).joined(separator: ", "))
+            try await loadLocal(root, cleanup: !result.installed.isEmpty)
+            activity = result.installed.isEmpty ? "ready" : "installedDone"
+            if let failure = installError(result) {
+                error = failure
+                await record("installing", "failed", error: failure)
+            } else {
+                await record("installing", "completed", detail: result.installed.map(\.title).joined(separator: ", "))
+            }
         } catch {
             await record("installing", "failed", error: error)
             self.error = error; activity = "ready"
@@ -294,6 +307,12 @@ import AppKit
             do { _ = try await installer.recover(root); try await loadLocal(root) }
             catch { blocked = true; self.error = error }
         }
+    }
+    private func installError(_ result: InstallResult) -> AppError? {
+        guard !result.failures.isEmpty else { return nil }
+        if result.installed.isEmpty && result.failures.count == 1 { return result.failures[0] }
+        let counts = "\(t("installed")): \(result.installed.count) · \(t("packagesSkipped")): \(result.failures.count)"
+        return AppError("somePackagesFailed", counts + "\n\n" + result.failures.map(localizedError).joined(separator: "\n\n"))
     }
     func localizedError(_ error: Error) -> String {
         if let app = error as? AppError { return t(app.key) + (app.detail.isEmpty ? "" : "\n\n" + app.detail) }

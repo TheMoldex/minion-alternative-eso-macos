@@ -50,7 +50,7 @@ Choose **Ignore updates** from an installed addon's context menu or details. Man
 
 The folder menu in Settings → General switches between saved ESO installations, including `live` and `pts`. **Choose folder** registers another folder; **Remove from folder list** forgets the selection without deleting any files. Addon sources, ignored updates, rollback copies and operation history are separate for each folder. The automatic updater operates only on the currently selected folder.
 
-**Concurrent downloads** in Settings → Updates accepts 1–4 downloads (default 3). Files are downloaded and checked before the batch is installed. A failed download cancels the rest of the batch without replacing installed addons.
+**Concurrent downloads** in Settings → Updates accepts 1–4 downloads (default 3). Files are downloaded and checked before the batch is installed. A failed download or invalid archive skips that package. Other updates continue when their required libraries are available, including compatible installed versions. The result lists skipped packages and the reason for each.
 
 **Operation history** persists the latest 500 entries for the selected folder, including addon names, timestamps and error stages. Use **Errors only** or **Copy history** for diagnostics.
 

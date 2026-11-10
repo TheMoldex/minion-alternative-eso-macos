@@ -29,7 +29,11 @@ enum ZipArchive {
             guard flags & 1 == 0, [0, 8].contains(method), length > 0, next <= end, expanded <= 128_000_000, let name = String(data: data[(offset + 46)..<(offset + 46 + length)], encoding: .utf8) else { throw bad() }
             let parts = name.split(separator: "/", omittingEmptySubsequences: false)
             let mode = (attributes >> 16) & 0xf000
-            guard !name.hasPrefix("/"), parts.count <= 40, name.utf8.count < 1024, parts.enumerated().allSatisfy({ i, p in (i == parts.count - 1 && p.isEmpty && name.hasSuffix("/")) || safeComponent(String(p)) }), [0, 0x8000, 0x4000].contains(mode) else { throw bad() }
+            let placeholder = parts.last == ".gitkeep" && [0, 0x8000].contains(mode)
+            guard !name.hasPrefix("/"), parts.count <= 40, name.utf8.count < 1024,
+                  parts.dropLast().allSatisfy({ safeComponent(String($0)) }), let last = parts.last,
+                  placeholder || last.isEmpty || safeComponent(String(last)),
+                  [0, 0x8000, 0x4000].contains(mode) else { throw bad() }
             let key = name.trimmingCharacters(in: CharacterSet(charactersIn: "/")).precomposedStringWithCanonicalMapping.lowercased()
             guard seen.insert(key).inserted else { throw bad() }
             guard local >= 0 && local + 30 <= start, try u32(local) == 0x04034b50, try u16(local + 8) == method, try u16(local + 6) == flags else { throw bad() }
@@ -38,7 +42,10 @@ enum ZipArchive {
                   data[(local + 30)..<(local + 30 + localLength)] == data[(offset + 46)..<(offset + 46 + length)] else { throw bad() }
             total += expanded
             guard total <= 512_000_000 else { throw bad() }
-            entries.append(Entry(name: name, offset: local + 30 + localLength + localExtra, compressed: try u32(offset + 20), expanded: expanded, method: method, crc: try u32(offset + 16))); offset = next
+            if !placeholder {
+                entries.append(Entry(name: name, offset: local + 30 + localLength + localExtra, compressed: try u32(offset + 20), expanded: expanded, method: method, crc: try u32(offset + 16)))
+            }
+            offset = next
         }
         guard offset == end else { throw bad() }
         return entries
@@ -170,6 +177,17 @@ struct InstallPlan: Sendable {
     let requestedIDs: Set<Int>
 }
 
+struct InstallResult: Sendable {
+    var installed: [Addon] = []
+    var failures: [AppError] = []
+}
+
+private struct PreparedPackage {
+    let addon: Addon
+    let unpacked: URL
+    let locals: [LocalAddon]
+}
+
 func dependencyPlan(_ requested: [Addon], catalog: [Addon], locals: [LocalAddon], sources: [String: Receipt]) throws -> InstallPlan {
     let manifests = locals.flatMap(\.manifests)
     var selected = Dictionary(uniqueKeysWithValues: requested.map { ($0.id, $0) })
@@ -268,38 +286,62 @@ actor Installer {
         }
         return count
     }
-    func install(_ plan: InstallPlan, root: URL, client: CatalogClient, parallelism: Int = 3, beforeCommit: @Sendable () throws -> Void = {}, progress: @escaping @Sendable (String) async -> Void) async throws {
+    @discardableResult
+    func install(_ plan: InstallPlan, root: URL, parallelism: Int = 3, beforeCommit: @Sendable () throws -> Void = {}, download: @escaping @Sendable (Addon, URL) async throws -> URL, progress: @escaping @Sendable (String) async -> Void) async throws -> InstallResult {
         let fd = try lock(root); defer { close(fd) }
         _ = try recoverLocked(root)
         guard plan.missing.isEmpty else { throw AppError("missingDependencies", plan.missing.joined(separator: ", ")) }
+        let names = plan.addons.flatMap(\.folders)
+        guard names.allSatisfy(safeComponent), Set(names.map { $0.lowercased() }).count == names.count,
+              Set(plan.addons.map(\.id)).count == plan.addons.count else { throw AppError("unexpectedFolders") }
         let temp = fm.temporaryDirectory.appendingPathComponent("eso-addons-\(UUID().uuidString)")
         try fm.createDirectory(at: temp, withIntermediateDirectories: true)
         defer { try? removeAddonTree(temp) }
-        let staged = temp.appendingPathComponent("staged")
-        try fm.createDirectory(at: staged, withIntermediateDirectories: true)
         let archives = try await parallelDownloads(plan.addons, limit: parallelism) { addon in
             await progress(addon.title)
-            do { return try await client.download(addon, to: temp) }
-            catch { throw packageError(error, addon: addon, stage: "download") }
+            return try await download(addon, temp)
         }
+        var result = InstallResult(), prepared = [PreparedPackage]()
         for addon in plan.addons {
             try Task.checkCancellation()
-            guard let zip = archives[addon.id] else { throw AppError("archiveError", addon.title) }
+            guard let archive = archives[addon.id] else { throw AppError("archiveError", addon.title) }
+            let zip: URL
+            switch archive {
+            case .success(let file): zip = file
+            case .failure(let error): result.failures.append(error); continue
+            }
             let unpacked = temp.appendingPathComponent("unpacked-\(addon.id)")
             do { try ZipArchive.extract(zip, into: unpacked, expected: addon.folders) }
-            catch { throw packageError(error, addon: addon, stage: "extract") }
-            for name in addon.folders { try fm.moveItem(at: unpacked.appendingPathComponent(name), to: staged.appendingPathComponent(name)) }
-        }
-        let newLocals = try scanAddons(staged)
-        for addon in plan.addons {
-            for name in addon.folders {
-                guard newLocals.contains(where: { $0.folder == name && !$0.manifests.isEmpty }) else { throw AppError("invalidManifest", name) }
+            catch { result.failures.append(packageError(error, addon: addon, stage: "extract")); continue }
+            do {
+                let locals = try scanAddons(unpacked, folders: Set(addon.folders))
+                for name in addon.folders where !locals.contains(where: { $0.folder == name && !$0.manifests.isEmpty }) {
+                    throw AppError("invalidManifest", name)
+                }
+                prepared.append(PreparedPackage(addon: addon, unpacked: unpacked, locals: locals))
+            } catch {
+                result.failures.append(packageError(error, addon: addon, stage: "manifest"))
             }
+        }
+        try Task.checkCancellation()
+        guard !prepared.isEmpty else { return result }
+        let accepted = try eligiblePackages(prepared, current: scanAddons(root), requested: plan.requestedIDs, failures: &result.failures)
+        guard !accepted.isEmpty else { return result }
+        let staged = temp.appendingPathComponent("staged")
+        try fm.createDirectory(at: staged, withIntermediateDirectories: true)
+        for package in accepted {
+            for name in package.addon.folders { try fm.moveItem(at: package.unpacked.appendingPathComponent(name), to: staged.appendingPathComponent(name)) }
         }
         try preservePrices(root: root, staged: staged)
         var next = try state(root)
-        for addon in plan.addons { for name in addon.folders { next.sources[name] = Receipt(id: addon.id, version: addon.version) } }
-        try apply(staged: staged, names: plan.addons.flatMap(\.folders), desired: next, root: root, label: plan.addons.map(\.title).joined(separator: ", "), beforeCommit: beforeCommit)
+        let installing = accepted.map(\.addon)
+        for addon in installing { for name in addon.folders { next.sources[name] = Receipt(id: addon.id, version: addon.version) } }
+        try apply(staged: staged, names: installing.flatMap(\.folders), desired: next, root: root, label: installing.map(\.title).joined(separator: ", "), beforeCommit: {
+            try Task.checkCancellation()
+            try beforeCommit()
+        })
+        result.installed = installing
+        return result
     }
     @discardableResult func remove(folders: [String], root: URL) throws -> [URL] {
         let fd = try lock(root); defer { close(fd) }
@@ -358,12 +400,57 @@ actor Installer {
     func validateDependencies(staged: URL, names: [String], root: URL) throws {
         let current = try scanAddons(root), replacing = Set(names.map { $0.lowercased() })
         let incoming = try scanAddons(staged).filter { replacing.contains($0.folder.lowercased()) }
+        let missing = missingRequirements(current: current, incoming: incoming, replacing: replacing)
+        guard missing.isEmpty else { throw AppError("missingDependencies", Set(missing.map { $0.folder + " → " + $0.dependency.display }).sorted().joined(separator: "\n")) }
+    }
+
+    private func missingRequirements(current: [LocalAddon], incoming: [LocalAddon], replacing: Set<String>) -> [(folder: String, dependency: Dependency)] {
         let retained = current.filter { !replacing.contains($0.folder.lowercased()) }
         let before = current.flatMap(\.manifests), after = retained.flatMap(\.manifests) + incoming.flatMap(\.manifests)
-        let missing = (incoming + retained).flatMap { local in local.manifests.flatMap { manifest in
-            manifest.dependencies.filter { !$0.satisfied(by: after) && (replacing.contains(local.folder.lowercased()) || $0.satisfied(by: before)) }.map { local.folder + " → " + $0.display }
-        } }
-        guard missing.isEmpty else { throw AppError("missingDependencies", Set(missing).sorted().joined(separator: "\n")) }
+        return (incoming + retained).flatMap { local in
+            local.manifests.flatMap(\.dependencies).filter { !$0.satisfied(by: after) && (replacing.contains(local.folder.lowercased()) || $0.satisfied(by: before)) }.map { (local.folder, $0) }
+        }
+    }
+
+    private func eligiblePackages(_ prepared: [PreparedPackage], current: [LocalAddon], requested: Set<Int>, failures: inout [AppError]) throws -> [PreparedPackage] {
+        var packages = prepared
+        while !packages.isEmpty {
+            try Task.checkCancellation()
+            var needed = requested
+            var pending = packages.filter { requested.contains($0.addon.id) }
+            while let package = pending.popLast() {
+                let dependencies = package.addon.dependencies + package.locals.flatMap(\.manifests).flatMap(\.dependencies)
+                for provider in packages where !needed.contains(provider.addon.id) {
+                    let manifests = provider.locals.flatMap(\.manifests)
+                    if dependencies.contains(where: { $0.satisfied(by: manifests) }) {
+                        needed.insert(provider.addon.id); pending.append(provider)
+                    }
+                }
+            }
+            packages.removeAll { !needed.contains($0.addon.id) }
+            let owners = Dictionary(uniqueKeysWithValues: packages.flatMap { package in package.addon.folders.map { ($0.lowercased(), package.addon.id) } })
+            let missing = missingRequirements(current: current, incoming: packages.flatMap(\.locals), replacing: Set(owners.keys))
+            guard !missing.isEmpty else { return packages }
+            var rejected = [Int: Set<String>]()
+            for issue in missing {
+                for local in current where issue.dependency.satisfied(by: local.manifests) {
+                    if let id = owners[local.folder.lowercased()] { rejected[id, default: []].insert(issue.folder + " → " + issue.dependency.display) }
+                }
+            }
+            if rejected.isEmpty {
+                for issue in missing {
+                    if let id = owners[issue.folder.lowercased()] { rejected[id, default: []].insert(issue.folder + " → " + issue.dependency.display) }
+                }
+            }
+            guard !rejected.isEmpty else { throw AppError("missingDependencies", missing.map { $0.folder + " → " + $0.dependency.display }.joined(separator: "\n")) }
+            for package in packages {
+                if let reasons = rejected[package.addon.id] {
+                    failures.append(packageError(AppError("missingDependencies", reasons.sorted().joined(separator: "\n")), addon: package.addon, stage: "dependencies"))
+                }
+            }
+            packages.removeAll { rejected[$0.addon.id] != nil }
+        }
+        return packages
     }
 
     func prepareReplacement(_ paths: [URL]) throws {

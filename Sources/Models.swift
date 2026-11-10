@@ -167,11 +167,11 @@ func cleanTitle(_ text: String) -> String {
     text.replacingOccurrences(of: "\\|[cC][0-9a-fA-F]{6}|\\|[rR]", with: "", options: .regularExpression)
 }
 
-func scanAddons(_ root: URL, tolerant: Bool = false) throws -> [LocalAddon] {
+func scanAddons(_ root: URL, tolerant: Bool = false, folders: Set<String>? = nil) throws -> [LocalAddon] {
     try requireDirectory(root)
     let fm = FileManager.default
     return try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]).compactMap { folder in
-        guard safeComponent(folder.lastPathComponent) else { return nil }
+        guard folders?.contains(folder.lastPathComponent) != false, safeComponent(folder.lastPathComponent) else { return nil }
         do {
             let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             guard values.isDirectory == true, values.isSymbolicLink != true else { return nil }
